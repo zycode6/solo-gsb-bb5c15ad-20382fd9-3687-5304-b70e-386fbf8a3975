@@ -255,8 +255,9 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
-  // 误差校核只针对已保存方案: 未保存(草稿)时禁用
+  // 误差校核/振动校准只针对已保存方案: 未保存(草稿)时禁用
   $("btnWeighing").disabled = !(record.id !== null && record.id !== undefined);
+  $("btnCalib").disabled = !(record.id !== null && record.id !== undefined);
 
   drawRotor(r);
   renderPairs(r);
@@ -492,6 +493,7 @@ async function renderHistory() {
     };
     d.querySelector('[data-a="load"]').onclick = () => loadPlan(it.id);
     d.querySelector('[data-a="weigh"]').onclick = () => openWeighingDialog(it.id);
+    d.querySelector('[data-a="calib"]').onclick = () => openCalibDialog(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
     d.querySelector('[data-a="del"]').onclick = async () => {
       if (!confirm(`删除方案 #${it.id}?`)) return;
@@ -830,6 +832,183 @@ $("btnWeighing").onclick = () => {
   }
 };
 $("btnCloseWeighing").onclick = () => $("weighingDialog").classList.remove("open");
+
+// ---------------------------------------------------------------------------
+// 实测振动校准(只读, 影响系数法; 试重视为已取下)
+// ---------------------------------------------------------------------------
+const calibState = { planId: null, freeSlots: [] };
+
+async function openCalibDialog(id) {
+  $("btnCalib")?.blur();
+  try {
+    const resp = await fetch(`/api/plan/${id}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "方案读取失败");
+    calibState.planId = id;
+    const occupied = new Set(
+      data.result.placements
+        .filter((p) => p.slot !== null && p.slot !== undefined)
+        .map((p) => p.slot));
+    calibState.freeSlots = data.result.slot_state
+      .filter((s) => s.enabled && !occupied.has(s.slot))
+      .map((s) => ({ slot: s.slot, angle: s.angle }))
+      .sort((a, b) => a.slot - b.slot);
+    if (!calibState.freeSlots.length) {
+      toast("该方案没有空闲启用槽位, 无法放置试重/配重。", true);
+      return;
+    }
+    $("calibMeta").innerHTML =
+      `方案 <b>#${data.id} ${data.name}</b> · ${new Date(data.created_at).toLocaleString()} ·
+       R=${data.request.radius_mm}mm · ${data.result.config.rpm} rpm ·
+       空闲启用槽 ${calibState.freeSlots.length} 个:
+       ${calibState.freeSlots.map((s) => `#${s.slot}(${fmt(s.angle, 0)}°)`).join("、")}`;
+    const sel = $("cbTrialSlot");
+    sel.innerHTML = calibState.freeSlots
+      .map((s) => `<option value="${s.slot}">#${s.slot} (${fmt(s.angle, 1)}°)</option>`)
+      .join("");
+    ["cbA0", "cbP0", "cbA1", "cbP1", "cbTrialMass"].forEach((x) => ($(x).value = ""));
+    $("cbP0").value = "0";
+    $("calibResult").innerHTML = "";
+    $("calibDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+function readNonNeg(id, label) {
+  const v = parseFloat($(id).value);
+  if (Number.isNaN(v) || !Number.isFinite(v) || v < 0) {
+    throw new Error(`${label}必须为有限的非负数。`);
+  }
+  return v;
+}
+
+$("btnCbRun").onclick = async () => {
+  const btn = $("btnCbRun");
+  btn.disabled = true;
+  try {
+    const a0 = readNonNeg("cbA0", "试重前幅值");
+    const p0 = readNonNeg("cbP0", "试重前相位");
+    const a1 = readNonNeg("cbA1", "试重后幅值");
+    const p1 = readNonNeg("cbP1", "试重后相位");
+    const mt = parseFloat($("cbTrialMass").value);
+    if (!(mt > 0) || !Number.isFinite(mt)) {
+      toast("试重质量必须为大于零的有限数。", true); return;
+    }
+    const masses = $("cbMasses").value.split(/[\s,;，；]+/)
+      .map((s) => s.trim()).filter(Boolean).map(Number);
+    if (!masses.length) { toast("请至少填写一个可用配重质量。", true); return; }
+    if (masses.some((m) => !(m > 0) || !Number.isFinite(m))) {
+      toast("可用配重质量都必须为大于零的有限数。", true); return;
+    }
+    const body = {
+      initial_amplitude: a0, initial_phase_deg: p0,
+      trial_amplitude: a1, trial_phase_deg: p1,
+      trial_mass_g: mt,
+      trial_slot: parseInt($("cbTrialSlot").value, 10),
+      available_masses: masses,
+    };
+    const resp = await fetch(`/api/plan/${calibState.planId}/vibration-calibration`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "校准计算失败");
+    renderCalibResult(data);
+  } catch (e) {
+    toast(e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function renderCalibResult(d) {
+  const box = $("calibResult");
+  const ic = d.influence_coefficient, rd = d.readings, best = d.best;
+  const impTxt = best.improvement_pct === null
+    ? "原读数为 0, 改善百分比不适用"
+    : `较原读数 <b class="${best.improvement >= 0 ? "delta-down" : "delta-up"}">
+        ${best.improvement >= 0 ? "下降" : "上升"}
+        ${fmt(Math.abs(best.improvement))} (${fmt(Math.abs(best.improvement_pct), 1)}%)</b>`;
+  const top = `<div class="wc-ok">✔ 推荐: <b>槽位 #${best.slot}
+      (${fmt(best.angle_deg, 1)}°)</b> 放置单枚配重
+      <b>${fmt(best.mass_g, 3)} g</b> → 预测残余幅值 <b>${fmt(best.predicted.amplitude)}</b>
+      @ ${fmt(best.predicted.phase_deg, 1)}° (原读数 ${fmt(rd.initial.amplitude)}
+      @ ${fmt(rd.initial.phase_deg, 1)}°), ${impTxt}。</div>`;
+
+  const icRow = `<table class="cmp-table">
+    <thead><tr><th>项目</th><th style="text-align:right">实部 x</th>
+      <th style="text-align:right">虚部 y</th><th style="text-align:right">幅值</th>
+      <th style="text-align:right">相位/方向</th></tr></thead>
+    <tbody>
+      <tr><td>试重前读数 V₀</td>
+        <td style="text-align:right">${fmt(rd.initial.x)}</td>
+        <td style="text-align:right">${fmt(rd.initial.y)}</td>
+        <td style="text-align:right">${fmt(rd.initial.amplitude)}</td>
+        <td style="text-align:right">${fmt(rd.initial.phase_deg, 1)}°</td></tr>
+      <tr><td>装试重后读数 V₁</td>
+        <td style="text-align:right">${fmt(rd.with_trial.x)}</td>
+        <td style="text-align:right">${fmt(rd.with_trial.y)}</td>
+        <td style="text-align:right">${fmt(rd.with_trial.amplitude)}</td>
+        <td style="text-align:right">${fmt(rd.with_trial.phase_deg, 1)}°</td></tr>
+      <tr><td>振动差 V₁−V₀</td>
+        <td style="text-align:right">${fmt(rd.delta.x)}</td>
+        <td style="text-align:right">${fmt(rd.delta.y)}</td>
+        <td style="text-align:right">${fmt(rd.delta.amplitude)}</td>
+        <td style="text-align:right">${fmt(rd.delta.phase_deg, 1)}°</td></tr>
+      <tr><td>影响系数 α</td>
+        <td style="text-align:right">${ic.x.toExponential(4)}</td>
+        <td style="text-align:right">${ic.y.toExponential(4)}</td>
+        <td style="text-align:right">${ic.magnitude.toExponential(4)}</td>
+        <td style="text-align:right">${fmt(ic.phase_deg, 1)}°</td></tr>
+    </tbody></table>
+    <div class="small" style="margin:5px 0">
+      α=(V₁−V₀)/(m_t·R·e^{iθ_t}), 试重 ${fmt(d.trial.mass_g, 3)} g @ 槽
+      #${d.trial.slot} (${fmt(d.trial.angle_deg, 1)}°), 试重质径积
+      ${fmt(d.trial.unbalance_g_mm)} g·mm;
+      连续意义理想配重: ${fmt(d.ideal_correction.equivalent_mass_g, 3)} g
+      @ ${fmt(d.ideal_correction.direction_deg, 1)}°
+      (|U*|=${fmt(d.ideal_correction.unbalance_g_mm)} g·mm, 不受槽位/离散质量限制, 仅供对照)。
+    </div>`;
+
+  const rows = d.candidates.map((c) => {
+    const better = c.improvement >= 0;
+    const pct = c.improvement_pct === null ? "–"
+      : `${c.improvement_pct >= 0 ? "−" : "+"}${fmt(Math.abs(c.improvement_pct), 1)}%`;
+    return `<tr${c.rank === 1 ? ' style="background:#10331f55"' : ""}>
+      <td>${c.rank === 1 ? '<b>★ ' : ""}${c.rank}${c.rank === 1 ? "</b>" : ""}</td>
+      <td>#${c.slot} <span class="small">(${fmt(c.angle_deg, 1)}°)</span></td>
+      <td>${fmt(c.mass_g, 3)}</td>
+      <td style="text-align:right"><b>${fmt(c.predicted.amplitude)}</b></td>
+      <td style="text-align:right">${fmt(c.predicted.phase_deg, 1)}°</td>
+      <td style="text-align:right" class="${better ? "delta-down" : "delta-up"}">
+        ${better ? "−" : "+"}${fmt(Math.abs(c.improvement))}</td>
+      <td style="text-align:right" class="${better ? "delta-down" : "delta-up"}">${pct}</td>
+    </tr>`;
+  }).join("");
+
+  box.innerHTML = `
+    ${top}
+    ${icRow}
+    <h2 style="font-size:13px;margin:10px 0 6px">逐空闲启用槽位 × 可用配重: 单枚配重预测
+      <span class="small">共 ${d.candidate_count} 种, 按残余幅值升序</span></h2>
+    <table class="cmp-table wc-table">
+      <thead><tr><th>排序</th><th>槽位 / 角度</th><th>配重(g)</th>
+        <th style="text-align:right">预测幅值</th><th style="text-align:right">预测相位</th>
+        <th style="text-align:right">幅值改善</th><th style="text-align:right">改善比例</th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="small" style="margin-top:6px">${d.note} 方案 #${d.plan.id} 未被修改。</div>`;
+}
+
+$("btnCalib").onclick = () => {
+  if (state.record && state.record.id !== null && state.record.id !== undefined) {
+    openCalibDialog(state.record.id);
+  } else {
+    toast("请先从历史方案载入一条已保存方案, 或先计算并保存方案。", true);
+  }
+};
+$("btnCloseCalib").onclick = () => $("calibDialog").classList.remove("open");
 
 // ---------------------------------------------------------------------------
 // 标签页 & 初始化

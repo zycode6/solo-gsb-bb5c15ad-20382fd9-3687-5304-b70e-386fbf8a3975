@@ -384,6 +384,75 @@ except main.HTTPException as e:
 assert call("GET", "/api/plan/1")["result"]["metrics"]["u1_mag_g_mm"] == nom_u1
 print("weighing-check validation/read-only OK")
 
+# ---- 实测振动校准(只读, 影响系数法) ----
+def vc_route(plan_id):
+    found = find("POST", f"/api/plan/{plan_id}/vibration-calibration")
+    return (found if isinstance(found, tuple) else (found, ()))
+def vc_call(plan_id, body):
+    fn, args = vc_route(plan_id)
+    req = types.SimpleNamespace(**body)
+    return fn(*args, req)
+
+disabled = {s["index"] for s in req_body["slots"] if not s["enabled"]}
+occupied = {p["slot"] for p in rec["result"]["placements"]}
+vc_trial = next(i for i in range(12) if i not in occupied and i not in disabled)
+# 合成线性系统: V0=5∠30°, α=1e-4∠60° (振动单位/g·mm)
+_v0 = 5.0 * complex(_math.cos(_math.radians(30)), _math.sin(_math.radians(30)))
+_alpha = 1e-4 * complex(_math.cos(_math.radians(60)), _math.sin(_math.radians(60)))
+_ut = 5.0 * 100.0 * complex(
+    _math.cos(_math.radians(30 * vc_trial)),
+    _math.sin(_math.radians(30 * vc_trial)))
+_v1 = _v0 + _alpha * _ut
+vc_body = {
+    "initial_amplitude": 5.0, "initial_phase_deg": 30.0,
+    "trial_amplitude": abs(_v1),
+    "trial_phase_deg": _math.degrees(_math.atan2(_v1.imag, _v1.real)) % 360.0,
+    "trial_mass_g": 5.0, "trial_slot": vc_trial,
+    "available_masses": [2.0, 5.0, 8.0],
+}
+vc = vc_call(1, vc_body)
+_got = complex(vc["influence_coefficient"]["x"], vc["influence_coefficient"]["y"])
+assert abs(_got - _alpha) < 1e-15, _got
+# 试重槽必须空闲启用
+free_vc = {f["slot"] for f in vc["free_enabled_slots"]}
+assert vc_trial in free_vc and occupied.isdisjoint(free_vc)
+# 候选按残余幅值升序, 首项即推荐
+vc_amps = [c["predicted"]["amplitude"] for c in vc["candidates"]]
+assert vc_amps == sorted(vc_amps)
+assert vc["best"]["rank"] == 1 and vc["candidate_count"] == len(free_vc) * 3
+# 独立复算首项预测向量: V0 + α·m·R·e^{iθ}
+_b = vc["best"]
+_u = _b["mass_g"] * 100.0 * complex(
+    _math.cos(_math.radians(_b["angle_deg"])),
+    _math.sin(_math.radians(_b["angle_deg"])))
+_pred = _v0 + _alpha * _u
+assert abs(_b["predicted"]["amplitude"] - abs(_pred)) < 1e-9
+assert abs(_b["improvement"] - (5.0 - abs(_pred))) < 1e-9
+# 试重已取下: 同质量配重放回试重槽, 预测应等于装入试重时读数 V1
+_same = next(c for c in vc["candidates"]
+             if c["slot"] == vc_trial and c["mass_g"] == 5.0)
+assert abs(_same["predicted"]["amplitude"] - abs(_v1)) < 1e-9
+# 校验错误: 试重槽已占用 / 不存在; 读数无变化(影响系数近零) -> 400
+for bad_vc in (
+    {**vc_body, "trial_slot": next(iter(occupied))},
+    {**vc_body, "trial_slot": 99},
+    {**vc_body, "trial_amplitude": 5.0, "trial_phase_deg": 30.0},
+):
+    try:
+        vc_call(1, bad_vc); raise SystemExit("should 400")
+    except main.HTTPException as e:
+        assert e.status_code == 400, e
+# 方案不存在 -> 404
+try:
+    vc_call(999, vc_body); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+# 只读: 校准后原方案指标不变
+assert call("GET", "/api/plan/1")["result"]["metrics"]["u1_mag_g_mm"] == nom_u1
+print("vibration-calibration best slot=%s mass=%s residual=%.4f OK" % (
+    vc["best"]["slot"], vc["best"]["mass_g"], vc["best"]["predicted"]["amplitude"]))
+
+
 # 列表 / 详情 / 导出 / 删除
 lst=call("GET","/api/plans")
 assert len(lst["items"])==3

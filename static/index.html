@@ -203,6 +203,7 @@ th{color:var(--mut);font-weight:500}
       <span class="small" id="solveInfo"></span>
       <div class="spacer" style="flex:1"></div>
       <button id="btnWeighing" disabled title="对已保存方案做称重误差校核(只读)">称重误差校核</button>
+      <button id="btnCalib" disabled title="对已保存方案做实测振动校准(只读, 影响系数法)">实测振动校准</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -317,6 +318,39 @@ th{color:var(--mut);font-weight:500}
       <span class="small">只读操作, 不会修改或覆盖历史方案。</span>
     </div>
     <div id="wcResult" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<div id="calibDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">实测振动校准(单枚配重预测)</h2><div style="flex:1"></div>
+      <button id="btnCloseCalib" class="ghost">关闭</button></div>
+    <div class="wc-note">槽位几何(角度/启用/占用)与半径只读取自该方案, 不可修改。在<b>同一转速、同一测点与相位参考</b>下
+      填入试重前与装入试重后的振动幅值/相位、试重质量及其所在<b>空槽</b>(必须空闲启用),
+      由复数振动差 ÷ 试重质径积求影响系数 α; 再给定若干可用配重质量,
+      对方案的每个空闲启用槽位逐一预测单枚配重后的振动向量并按残余幅值排序。
+      <b>试重视为已取下</b>, 预测以试重前读数为基线; 计算<b>只读</b>, 结果不保存、不覆盖原方案。
+      两次读数几乎无变化(α 近零)时将明确拒绝推荐。</div>
+    <div id="calibMeta" class="small" style="margin:4px 0 8px"></div>
+    <h2 style="font-size:13px;margin:8px 0 6px">① 试重前后振动读数与试重</h2>
+    <div class="grid3" style="gap:10px">
+      <div><label>试重前幅值 A₀</label><input id="cbA0" type="number" min="0" step="any" placeholder="如 5.0"></div>
+      <div><label>试重前相位 φ₀ (°)</label><input id="cbP0" type="number" min="0" step="any" placeholder="0 ~ 360"></div>
+      <div></div>
+      <div><label>装试重后幅值 A₁</label><input id="cbA1" type="number" min="0" step="any" placeholder="如 6.2"></div>
+      <div><label>装试重后相位 φ₁ (°)</label><input id="cbP1" type="number" min="0" step="any" placeholder="0 ~ 360"></div>
+      <div></div>
+      <div><label>试重质量 (g)</label><input id="cbTrialMass" type="number" min="0" step="any" placeholder="如 5"></div>
+      <div><label>试重槽位(空闲启用)</label><select id="cbTrialSlot"></select></div>
+      <div></div>
+    </div>
+    <h2 style="font-size:13px;margin:12px 0 6px">② 可用配重质量(g), 逗号/空格分隔</h2>
+    <div class="rowline">
+      <input id="cbMasses" type="text" value="1, 2, 5, 10" style="flex:1"
+             placeholder="例如 1, 2, 5, 10">
+      <button id="btnCbRun" class="primary">计算影响系数并预测</button>
+    </div>
+    <div id="calibResult" style="margin-top:8px"></div>
   </div>
 </div>
 

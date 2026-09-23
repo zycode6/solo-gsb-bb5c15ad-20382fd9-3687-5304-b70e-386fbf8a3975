@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .balancer import run_plan
+from .calibration import predict_single_weight_balancing
 from .compare import compare_plans
 from .weighing import worst_case_u1
 
@@ -89,6 +90,23 @@ class WeighingCheckRequest(BaseModel):
     tube_errors: list[TubeErrorIn] = Field(default_factory=list)
     # 一阶不平衡量限值(g·mm), 以最不利 |U₁| 判定
     u1_limit_g_mm: Optional[float] = Field(default=None, ge=0)
+
+
+class VibrationCalibrationRequest(BaseModel):
+    # 同一转速、同一测点/相位参考下的试重前振动读数
+    # 注: 有限性/非负性由校准逻辑统一校验并返回 400(避免 pydantic 回显 NaN/Inf
+    # 导致错误响应本身无法 JSON 序列化); 类型错误仍由 pydantic 返回 422
+    initial_amplitude: float
+    initial_phase_deg: float
+    # 装入试重后的振动读数
+    trial_amplitude: float
+    trial_phase_deg: float
+    # 试重质量(g)及其空槽; 空槽必须在方案中存在、启用且空闲
+    trial_mass_g: float
+    trial_slot: int
+    # 若干可用单枚配重质量(g), 逐个空槽枚举预测; 空列表由 pydantic 拒绝,
+    # 每项必须 > 0 且有限由校准逻辑校验
+    available_masses: list[float] = Field(min_length=1)
 
 
 class PlanRequest(BaseModel):
@@ -360,6 +378,42 @@ def weighing_check(plan_id: int, req: WeighingCheckRequest) -> dict[str, Any]:
         "created_at": plan["created_at"],
     }
     return check
+
+
+@app.post("/api/plan/{plan_id}/vibration-calibration")
+def vibration_calibration(plan_id: int, req: VibrationCalibrationRequest) -> dict[str, Any]:
+    """对已保存方案做实测振动校准(只读): 影响系数法 + 单枚配重预测。
+
+    槽位几何(角度/启用/占用)与半径均只读取自方案; 试重槽必须是方案中的
+    空闲启用槽。由试重前/后同转速复数振动差与试重质径积求影响系数,
+    再在每个空闲启用槽位上对每枚可用配重预测残余振动并按幅值排序。
+    试重视为已取下, 结果不保存、不覆盖原方案。
+    """
+    row = _load_plan_row(plan_id)
+    plan = _row_to_plan(row)
+    result = plan["result"]
+    radius_mm = float(result["config"]["radius_mm"])
+    try:
+        calib = predict_single_weight_balancing(
+            slot_state=result.get("slot_state", []),
+            radius_mm=radius_mm,
+            initial_amplitude=req.initial_amplitude,
+            initial_phase_deg=req.initial_phase_deg,
+            trial_amplitude=req.trial_amplitude,
+            trial_phase_deg=req.trial_phase_deg,
+            trial_mass_g=req.trial_mass_g,
+            trial_slot=req.trial_slot,
+            available_masses=list(req.available_masses),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    calib["rpm"] = float(result["config"]["rpm"])
+    calib["plan"] = {
+        "id": plan["id"],
+        "name": plan["name"],
+        "created_at": plan["created_at"],
+    }
+    return calib
 
 
 # ---------------------------------------------------------------------------
