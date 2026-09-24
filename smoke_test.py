@@ -384,6 +384,82 @@ except main.HTTPException as e:
 assert call("GET", "/api/plan/1")["result"]["metrics"]["u1_mag_g_mm"] == nom_u1
 print("weighing-check validation/read-only OK")
 
+# ---- 实测振动校准(只读, 试重法) ----
+def cal_route(plan_id):
+    found = find("POST", f"/api/plan/{plan_id}/vibration-calibration")
+    return (found if isinstance(found, tuple) else (found, ()))
+def cal_call(plan_id, body):
+    fn, args = cal_route(plan_id)
+    req = types.SimpleNamespace(
+        baseline_mag=float(body["baseline_mag"]),
+        baseline_phase_deg=float(body["baseline_phase_deg"]),
+        with_weight_mag=float(body["with_weight_mag"]),
+        with_weight_phase_deg=float(body["with_weight_phase_deg"]),
+        trial_mass_g=float(body["trial_mass_g"]),
+        trial_slot=int(body["trial_slot"]),
+        available_masses=[float(x) for x in body.get("available_masses", [])],
+    )
+    return fn(*args, req)
+
+# 合成已知 alpha: 0.02 读数/(g·mm) @120°, V0=10@0°, 试重 5g 放某空闲启用槽
+cal_alpha = 0.02 * complex(_math.cos(_math.radians(120)), _math.sin(_math.radians(120)))
+v0c = complex(10.0, 0.0)
+trial_s = next(s["slot"] for s in rec["result"]["slot_state"]
+               if s["enabled"] and s["tube_id"] is None)
+trial_a = _math.radians(next(s["angle"] for s in rec["request"]["slots"]
+                             if s["index"] == trial_s))
+v1c = v0c + cal_alpha * (5.0 * 100.0 * complex(_math.cos(trial_a), _math.sin(trial_a)))
+cal_body = {
+    "baseline_mag": 10.0, "baseline_phase_deg": 0.0,
+    "with_weight_mag": abs(v1c),
+    "with_weight_phase_deg": _math.degrees(_math.atan2(v1c.imag, v1c.real)) % 360,
+    "trial_mass_g": 5.0, "trial_slot": trial_s,
+    "available_masses": [3.0, 5.0, 8.0],
+}
+cal = cal_call(1, cal_body)
+assert abs(cal["influence_coefficient"]["mag"] - 0.02) < 1e-9
+assert abs(cal["influence_coefficient"]["phase_deg"] - 120.0) < 1e-9
+mags = [p["predicted"]["mag"] for p in cal["predictions"]]
+assert mags == sorted(mags)
+best = cal["recommendation"]
+assert best["predicted"]["mag"] == min(mags)
+# 预测公式复算
+for p in cal["predictions"]:
+    th = _math.radians(p["angle_deg"])
+    expect = v0c + cal_alpha * (p["mass_g"] * 100.0 * complex(_math.cos(th), _math.sin(th)))
+    assert abs(abs(expect) - p["predicted"]["mag"]) < 1e-7
+assert best["improvement_pct"] is not None
+print("vibration-calibration alpha/prediction OK, best slot=%s mass=%g resid=%.4f" % (
+    best["slot"], best["mass_g"], best["predicted"]["mag"]))
+
+# 无可用配重: 只标定不推荐
+cal_nomass = cal_call(1, {**cal_body, "available_masses": []})
+assert cal_nomass["recommendation"] is None and cal_nomass["predictions"] == []
+assert abs(cal_nomass["influence_coefficient"]["mag"] - 0.02) < 1e-9
+
+# 校验失败 -> 400: 试重槽占用 / 禁用 / 影响系数近零 / 试重质量非正 / 负读数
+occ_slot = next(p["slot"] for p in rec["result"]["placements"])
+for bad_body in (
+    {**cal_body, "trial_slot": occ_slot},       # 已占用
+    {**cal_body, "trial_slot": 6},              # 已禁用
+    {**cal_body, "with_weight_mag": 10.0,
+     "with_weight_phase_deg": 0.0},              # ΔV=0, α 近零
+    {**cal_body, "trial_mass_g": 0.0},
+    {**cal_body, "baseline_mag": -1.0},
+):
+    try:
+        cal_call(1, bad_body); raise SystemExit("should 400")
+    except main.HTTPException as e:
+        assert e.status_code == 400, e
+# 方案不存在 -> 404
+try:
+    cal_call(999, cal_body); raise SystemExit("should 404")
+except main.HTTPException as e:
+    assert e.status_code == 404
+# 只读: 校准后原方案指标不变
+assert call("GET", "/api/plan/1")["result"]["metrics"]["u1_mag_g_mm"] == nom_u1
+print("vibration-calibration validation/read-only OK")
+
 # 列表 / 详情 / 导出 / 删除
 lst=call("GET","/api/plans")
 assert len(lst["items"])==3

@@ -113,6 +113,13 @@ th{color:var(--mut);font-weight:500}
 .wc-hi{color:var(--warn);font-weight:600}
 .wc-pos{color:var(--bad)} .wc-neg{color:var(--acc2)}
 .dialog .box.wider{width:min(860px,95vw)}
+.cal-best{background:#10331f;border:1px solid var(--acc2);color:#bbf7d0;border-radius:9px;
+  padding:11px 14px;font-size:13.5px;line-height:1.7;margin:10px 0}
+.cal-best .big{font-size:16px;font-weight:700;color:#fff}
+.cal-info{background:var(--panel2);border:1px solid var(--line);border-radius:8px;
+  padding:9px 12px;font-size:12.5px;line-height:1.7;margin:8px 0}
+.cal-table td:nth-child(n+3){text-align:right}
+.cal-rec-row{background:#16283c}
 .cmp-grid{display:grid;grid-template-columns:1fr 1fr;gap:12px}
 .cmp-col h3{font-size:13px;margin:0 0 6px;color:var(--acc)}
 .cmp-col h3.b{color:var(--acc2)}
@@ -135,7 +142,7 @@ th{color:var(--mut);font-weight:500}
     <h1>离心机转子配平规划器
       <span class="badge">FastAPI · SQLite</span>
     </h1>
-    <div class="sub">在质量与角度约束下搜索近似最优对称布局 · 合力矩 / 二阶不平衡量 · 锁定增量重排 · 步骤回放 · JSON 导出</div>
+    <div class="sub">在质量与角度约束下搜索近似最优对称布局 · 合力矩 / 二阶不平衡量 · 锁定增量重排 · 步骤回放 · JSON 导出 · 称重误差校核 / 实测振动校准(只读)</div>
   </div>
   <div class="spacer"></div>
   <button id="btnSample">载入示例</button>
@@ -203,6 +210,7 @@ th{color:var(--mut);font-weight:500}
       <span class="small" id="solveInfo"></span>
       <div class="spacer" style="flex:1"></div>
       <button id="btnWeighing" disabled title="对已保存方案做称重误差校核(只读)">称重误差校核</button>
+      <button id="btnCalib" disabled title="对已保存方案做实测振动校准(只读): 试重法求影响系数并预测配重">实测振动校准</button>
       <button id="btnExport" disabled>导出 JSON</button>
       <button id="btnCopy" disabled>复制 JSON</button>
     </div>
@@ -317,6 +325,48 @@ th{color:var(--mut);font-weight:500}
       <span class="small">只读操作, 不会修改或覆盖历史方案。</span>
     </div>
     <div id="wcResult" style="margin-top:6px"></div>
+  </div>
+</div>
+
+<div id="calibDialog" class="dialog">
+  <div class="box wider">
+    <div class="rowline"><h2 style="margin:0">实测振动校准(试重法 · 只读)</h2><div style="flex:1"></div>
+      <button id="btnCloseCalib" class="ghost">关闭</button></div>
+    <div class="wc-note">在<b>同一转速</b>下记录两次振动读数: 试重前(原始)与在空槽装入试重后。
+      槽位角度、占用情况与半径固定取自该方案, 不可修改; <b>试重视为已取下</b>, 校准与预测
+      不修改、不保存、不覆盖原方案。相位按仪器读数的同一基准填写(0–360°), 槽位角度与
+      本应用约定一致(0° 正上方、顺时针)。后端以复数振动差除以试重质径方向标定影响系数
+      α=(V₁−V₀)/(W·R·e<sup>iθ</sup>), 再在每个<b>空闲启用槽</b>上对每种可用配重质量
+      预测单枚配重后的振动向量并按残余幅值排序。</div>
+    <div id="calibMeta" class="small" style="margin:4px 0 8px"></div>
+    <div class="grid2" style="gap:12px">
+      <div class="cal-info">
+        <b>试重前读数 V₀(原始状态)</b>
+        <div class="grid2" style="margin-top:6px">
+          <div><label>振动幅值</label><input id="calMag0" type="number" min="0" step="any" placeholder="例如 10"></div>
+          <div><label>相位 (°)</label><input id="calPhase0" type="number" min="0" step="any" placeholder="0–360"></div>
+        </div>
+      </div>
+      <div class="cal-info">
+        <b>装入试重后读数 V₁(同一转速)</b>
+        <div class="grid2" style="margin-top:6px">
+          <div><label>振动幅值</label><input id="calMag1" type="number" min="0" step="any" placeholder="例如 14"></div>
+          <div><label>相位 (°)</label><input id="calPhase1" type="number" min="0" step="any" placeholder="0–360"></div>
+        </div>
+      </div>
+    </div>
+    <div class="grid3" style="gap:12px;margin-top:4px">
+      <div><label>试重质量 W (g)</label><input id="calTrialMass" type="number" min="0" step="any" placeholder="必须 &gt; 0"></div>
+      <div><label>试重槽位(必须空闲启用)</label>
+        <select id="calTrialSlot"></select></div>
+      <div><label>可用配重质量 (g, 逗号/空格分隔)</label>
+        <input id="calMasses" type="text" placeholder="例如 3, 5, 8, 10"></div>
+    </div>
+    <div class="rowline" style="margin-top:10px">
+      <button id="btnCalibRun" class="primary">标定并预测配重</button>
+      <span class="small">只读操作, 不会修改或覆盖历史方案; 试重视为已取下。</span>
+    </div>
+    <div id="calibResult" style="margin-top:6px"></div>
   </div>
 </div>
 

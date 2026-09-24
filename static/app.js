@@ -255,8 +255,10 @@ function renderResult(record) {
   sum.innerHTML = r.summary;
   $("btnExport").disabled = false;
   $("btnCopy").disabled = false;
-  // 误差校核只针对已保存方案: 未保存(草稿)时禁用
-  $("btnWeighing").disabled = !(record.id !== null && record.id !== undefined);
+  // 误差校核/振动校准只针对已保存方案: 未保存(草稿)时禁用
+  const saved = record.id !== null && record.id !== undefined;
+  $("btnWeighing").disabled = !saved;
+  $("btnCalib").disabled = !saved;
 
   drawRotor(r);
   renderPairs(r);
@@ -492,6 +494,7 @@ async function renderHistory() {
     };
     d.querySelector('[data-a="load"]').onclick = () => loadPlan(it.id);
     d.querySelector('[data-a="weigh"]').onclick = () => openWeighingDialog(it.id);
+    d.querySelector('[data-a="calib"]').onclick = () => openCalibDialog(it.id);
     d.querySelector('[data-a="export"]').onclick = () => { window.location = `/api/plan/${it.id}/export`; };
     d.querySelector('[data-a="del"]').onclick = async () => {
       if (!confirm(`删除方案 #${it.id}?`)) return;
@@ -830,6 +833,171 @@ $("btnWeighing").onclick = () => {
   }
 };
 $("btnCloseWeighing").onclick = () => $("weighingDialog").classList.remove("open");
+
+// ---------------------------------------------------------------------------
+// 实测振动校准(只读, 基于已保存方案; 试重法/影响系数)
+// ---------------------------------------------------------------------------
+const calibState = { planId: null, plan: null, freeSlots: [] };
+
+function parseMassList(txt) {
+  const out = [];
+  for (const tok of String(txt).split(/[\s,，;；]+/)) {
+    if (tok === "") continue;
+    const v = parseFloat(tok);
+    if (!Number.isFinite(v)) return { error: `“${tok}” 不是有效数字。` };
+    out.push(v);
+  }
+  return { masses: out };
+}
+
+async function openCalibDialog(id) {
+  $("btnCalib")?.blur();
+  try {
+    const resp = await fetch(`/api/plan/${id}`);
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "方案读取失败");
+    calibState.planId = id;
+    calibState.plan = data;
+    calibState.freeSlots = data.result.slot_state
+      .filter((s) => s.enabled && (s.tube_id === null || s.tube_id === undefined))
+      .map((s) => ({ slot: s.slot, angle: s.angle }))
+      .sort((a, b) => a.slot - b.slot);
+    $("calibMeta").innerHTML =
+      `方案 <b>#${data.id} ${data.name}</b> · ${new Date(data.created_at).toLocaleString()} ·
+       R=${data.request.radius_mm}mm · ${data.result.config.rpm} rpm ·
+       空闲启用槽 ${calibState.freeSlots.length} 个:
+       ${calibState.freeSlots.map((s) => `#${s.slot}(${fmt(s.angle, 1)}°)`).join("、") || "无"}`;
+    const sel = $("calibTrialSlot");
+    sel.innerHTML = calibState.freeSlots
+      .map((s) => `<option value="${s.slot}">槽 ${s.slot} (${fmt(s.angle, 1)}°)</option>`)
+      .join("");
+    for (const fid of ["calMag0", "calPhase0", "calMag1", "calPhase1",
+                       "calTrialMass", "calMasses"]) {
+      $(fid).value = "";
+    }
+    $("calibResult").innerHTML = "";
+    $("calibDialog").classList.add("open");
+  } catch (e) {
+    toast(e.message, true);
+  }
+}
+
+$("btnCalibRun").onclick = async () => {
+  const num = (id) => parseFloat($(id).value);
+  const mag0 = num("calMag0"), phase0 = num("calPhase0");
+  const mag1 = num("calMag1"), phase1 = num("calPhase1");
+  const trialMass = num("calTrialMass");
+  const trialSlot = parseInt($("calibTrialSlot").value);
+  const parsed = parseMassList($("calMasses").value);
+
+  if (!calibState.freeSlots.length) {
+    toast("该方案没有空闲启用槽位, 无法进行试重校准。", true); return;
+  }
+  if (!Number.isInteger(trialSlot)) { toast("请选择试重槽位。", true); return; }
+  if (![mag0, phase0, mag1, phase1, trialMass].every(Number.isFinite)) {
+    toast("请完整填写两次振动读数(幅值、相位)与试重质量。", true); return;
+  }
+  if (mag0 < 0 || mag1 < 0) { toast("振动幅值不能为负。", true); return; }
+  if (phase0 < 0 || phase1 < 0) { toast("振动相位不能为负 (0–360°)。", true); return; }
+  if (!(trialMass > 0)) { toast("试重质量必须大于零。", true); return; }
+  if (parsed.error) { toast(parsed.error, true); return; }
+  if (parsed.masses.some((m) => m <= 0)) { toast("可用配重质量必须全部大于零。", true); return; }
+  if (!parsed.masses.length) { toast("请至少填写一个可用配重质量。", true); return; }
+
+  const btn = $("btnCalibRun");
+  btn.disabled = true;
+  try {
+    const resp = await fetch(`/api/plan/${calibState.planId}/vibration-calibration`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        baseline_mag: mag0, baseline_phase_deg: phase0,
+        with_weight_mag: mag1, with_weight_phase_deg: phase1,
+        trial_mass_g: trialMass, trial_slot: trialSlot,
+        available_masses: parsed.masses,
+      }),
+    });
+    const data = await resp.json();
+    if (!resp.ok) throw new Error(data.detail || "校准失败");
+    renderCalibResult(data);
+  } catch (e) {
+    toast(e.message, true);
+    $("calibResult").innerHTML =
+      `<div class="wc-bad">✘ ${e.message.replace(/</g, "&lt;")}</div>`;
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+function improveCell(imp, pct) {
+  if (imp > 1e-9) {
+    const p = pct === null || pct === undefined ? "" : ` <span class="small">(${fmt(pct, 1)}%)</span>`;
+    return `<span class="delta-down">−${fmt(imp)}${p}</span>`;
+  }
+  if (imp < -1e-9) {
+    const p = pct === null || pct === undefined ? "" : ` <span class="small">(${fmt(pct, 1)}%)</span>`;
+    return `<span class="delta-up">+${fmt(-imp)}${p}</span>`;
+  }
+  return '<span class="delta-flat">0</span>';
+}
+
+function renderCalibResult(d) {
+  const box = $("calibResult");
+  const r0 = d.readings.before_trial, r1 = d.readings.with_weight;
+  const dv = d.readings.delta, a = d.influence_coefficient;
+  const best = d.recommendation;
+  const ideal = d.ideal_single_weight;
+
+  let bestHtml;
+  if (best) {
+    bestHtml = `<div class="cal-best">✔ <b>推荐: 槽位 ${best.slot} (${fmt(best.angle_deg, 1)}°)
+        · 配重 ${fmt(best.mass_g, 3)} g</b><br>
+      预测残余幅值 <span class="big">${fmt(best.predicted.mag)}</span>
+      @ ${fmt(best.predicted.phase_deg, 1)}° ·
+      相对原读数 ${fmt(r0.mag)} 改善 ${improveCell(best.improvement_mag, best.improvement_pct)}<br>
+      <span class="small">连续最优(不受离散槽/质量限制): 约 ${fmt(ideal.mass_g, 3)} g @
+      ${fmt(ideal.angle_deg, 1)}°; 预测前提为试重已取下、仅装入此单枚配重。</span></div>`;
+  } else {
+    bestHtml = '<div class="wc-note">未提供可用配重质量, 仅完成影响系数标定。</div>';
+  }
+
+  const rows = d.predictions.map((p) => `
+    <tr class="${best && p === best ? "cal-rec-row" : ""}">
+      <td>${p.slot} <span class="small">(${fmt(p.angle_deg, 1)}°)</span></td>
+      <td>${fmt(p.mass_g, 3)}</td>
+      <td><b>${fmt(p.predicted.mag)}</b></td>
+      <td>${fmt(p.predicted.phase_deg, 1)}°</td>
+      <td>${improveCell(p.improvement_mag, p.improvement_pct)}</td>
+      ${best && p === best ? '<td><span class="pill" style="color:var(--acc2);border-color:var(--acc2)">推荐</span></td>' : "<td></td>"}
+    </tr>`).join("");
+
+  box.innerHTML = `
+    ${bestHtml}
+    <div class="cal-info">
+      <b>试重标定</b> · 试重 ${fmt(d.trial.mass_g, 3)} g @ 槽 ${d.trial.slot}
+      (${fmt(d.trial.angle_deg, 1)}°), 质径积 ${fmt(d.trial.mass_radius_g_mm)} g·mm, R=${d.radius_mm}mm<br>
+      V₀=${fmt(r0.mag)} @ ${fmt(r0.phase_deg, 1)}° → V₁=${fmt(r1.mag)} @ ${fmt(r1.phase_deg, 1)}°,
+      ΔV=${fmt(dv.mag)} @ ${fmt(dv.phase_deg, 1)}°<br>
+      影响系数 |α|=${fmt(a.mag, 6)} ${a.reading_unit_per_g_mm} @ ${fmt(a.phase_deg, 1)}°
+    </div>
+    <h2 style="font-size:13px;margin:10px 0 6px">逐空闲启用槽 × 可用配重的单枚预测
+      <span class="small">(按预测残余幅值升序; 改善量为相对原读数 |V₀|=${fmt(r0.mag)} 的幅值下降)</span></h2>
+    <table class="cmp-table cal-table">
+      <thead><tr><th>槽位/角度</th><th>配重(g)</th><th>预测幅值</th><th>预测相位</th>
+        <th>幅值改善</th><th></th></tr></thead>
+      <tbody>${rows}</tbody>
+    </table>
+    <div class="small" style="margin-top:6px">算法: ${d.method}。
+      本次校准为只读结果, 方案 #${d.plan.id} 未被修改。</div>`;
+}
+
+$("btnCalib").onclick = () => {
+  if (state.record && state.record.id !== null && state.record.id !== undefined) {
+    openCalibDialog(state.record.id);
+  } else {
+    toast("请先从历史方案载入一条已保存方案, 或先计算并保存方案。", true);
+  }
+};
+$("btnCloseCalib").onclick = () => $("calibDialog").classList.remove("open");
 
 // ---------------------------------------------------------------------------
 // 标签页 & 初始化

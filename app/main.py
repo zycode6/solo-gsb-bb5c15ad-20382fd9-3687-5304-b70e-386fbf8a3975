@@ -8,7 +8,7 @@ import sqlite3
 import time
 from contextlib import contextmanager
 from datetime import datetime, timezone
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import FileResponse, JSONResponse
@@ -16,6 +16,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .balancer import run_plan
+from .calibration import calibrate_predictions
 from .compare import compare_plans
 from .weighing import worst_case_u1
 
@@ -89,6 +90,21 @@ class WeighingCheckRequest(BaseModel):
     tube_errors: list[TubeErrorIn] = Field(default_factory=list)
     # 一阶不平衡量限值(g·mm), 以最不利 |U₁| 判定
     u1_limit_g_mm: Optional[float] = Field(default=None, ge=0)
+
+
+class VibrationCalibrationRequest(BaseModel):
+    # 同一转速下试重前(原始)振动读数: 幅值(非负)与相位(0–360°)
+    baseline_mag: float = Field(ge=0)
+    baseline_phase_deg: float = Field(ge=0)
+    # 装入试重后的振动读数: 幅值(非负)与相位(0–360°)
+    with_weight_mag: float = Field(ge=0)
+    with_weight_phase_deg: float = Field(ge=0)
+    # 试重质量(g), 必须为正; 试重视为已取下
+    trial_mass_g: float = Field(gt=0)
+    # 装入试重的槽位: 必须为该方案的空闲启用槽, 由校准逻辑校验
+    trial_slot: int
+    # 若干可用配重质量(g), 各自必须为正; 可只做标定不给质量
+    available_masses: list[Annotated[float, Field(gt=0)]] = Field(default_factory=list)
 
 
 class PlanRequest(BaseModel):
@@ -360,6 +376,43 @@ def weighing_check(plan_id: int, req: WeighingCheckRequest) -> dict[str, Any]:
         "created_at": plan["created_at"],
     }
     return check
+
+
+@app.post("/api/plan/{plan_id}/vibration-calibration")
+def vibration_calibration(
+    plan_id: int, req: VibrationCalibrationRequest
+) -> dict[str, Any]:
+    """对已保存方案做实测振动校准(只读): 试重法标定影响系数并预测单枚配重。
+
+    输入同一转速下试重前与装入试重后的振动幅值/相位、试重质量及其空槽,
+    以复数振动差除以试重质径方向求影响系数; 随后在方案的每个空闲启用槽位
+    上, 对每种给定可用配重质量预测装入单枚配重后的振动向量, 按残余幅值
+    排序返回推荐。试重视为已取下; 不修改、不覆盖原方案。
+    """
+    plan = _row_to_plan(_load_plan_row(plan_id))
+    # NaN/Infinity 无法由 JSON 约束直接以 400 中文提示拒绝, 这里显式兜底
+    raw_vals = [
+        req.baseline_mag, req.baseline_phase_deg,
+        req.with_weight_mag, req.with_weight_phase_deg,
+        req.trial_mass_g,
+    ]
+    if any(not math.isfinite(float(x)) for x in raw_vals):
+        raise HTTPException(status_code=400, detail="读数与试重质量必须为有限数值。")
+    if any(not math.isfinite(float(m)) for m in req.available_masses):
+        raise HTTPException(status_code=400, detail="可用配重质量必须为有限数值。")
+    try:
+        return calibrate_predictions(
+            plan,
+            baseline_mag=req.baseline_mag,
+            baseline_phase_deg=req.baseline_phase_deg,
+            with_weight_mag=req.with_weight_mag,
+            with_weight_phase_deg=req.with_weight_phase_deg,
+            trial_mass_g=req.trial_mass_g,
+            trial_slot=req.trial_slot,
+            available_masses=list(req.available_masses),
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 # ---------------------------------------------------------------------------
